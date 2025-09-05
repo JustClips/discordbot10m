@@ -4,18 +4,23 @@ import re
 import requests
 import threading
 import json
+from discord.ext import tasks
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_IDS = [int(cid.strip()) for cid in os.getenv("CHANNEL_ID", "1234567890").split(",")]
 WEBHOOK_URLS = [url.strip() for url in os.getenv("WEBHOOK_URLS", "").split(",") if url.strip()]
 BACKEND_URL = os.getenv("BACKEND_URL")
 
-client = discord.Client()
+intents = discord.Intents.default()
+intents.message_content = True
+client = discord.Client(intents=intents)
+
+# Store parsed messages to be sent later
+pending_updates = []
 
 def clean_field(text):
     if not text:
         return text
-    # Remove bold, italic, and code formatting
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
     text = re.sub(r'\*(.*?)\*', r'\1', text)
     text = re.sub(r'^`{3,}([^\n]*?)`{3,}$', r'\1', text, flags=re.DOTALL)
@@ -23,7 +28,6 @@ def clean_field(text):
     return text
 
 def parse_embed_fields(message):
-    # Only process the first embed (your format)
     if not message.embeds or not hasattr(message.embeds[0], 'fields'):
         return None
     embed = message.embeds[0]
@@ -64,7 +68,6 @@ def send_to_webhooks(payload):
         threading.Thread(target=send, args=(url, payload)).start()
 
 def send_to_backend(info):
-    # Your backend expects name, serverId, jobId, moneyPerSec, players
     server_id = "brainrot"
     if not info["name"] or not info["jobid"]:
         print("Skipping backend send - missing name or jobid")
@@ -85,55 +88,60 @@ def send_to_backend(info):
     except Exception as e:
         print(f"❌ Failed to send to backend: {e}")
 
-def send_servers_list_to_backend(servers):
-    # This will POST the full list to the backend in the same format
-    try:
-        for s in servers:
-            payload = {
-                "name": s.get("name"),
-                "serverId": s.get("serverId"),
-                "jobId": s.get("jobId"),
-                "moneyPerSec": s.get("moneyPerSec"),
-                "players": s.get("players")
-            }
-            r = requests.post(BACKEND_URL, json=payload, timeout=10)
-            if r.status_code == 200:
-                print(f"✅ Sent server to backend: {payload['name']}")
-            else:
-                print(f"❌ Backend error {r.status_code}: {r.text}")
-    except Exception as e:
-        print(f"❌ Failed to send servers list to backend: {e}")
-
 @client.event
 async def on_ready():
     print(f'Logged in as {client.user}')
     print(f'Watching channels: {CHANNEL_IDS}')
+    send_loop.start()
 
 @client.event
 async def on_message(message):
     if message.channel.id not in CHANNEL_IDS:
         return
 
-    # Try to parse a servers list if present in the message content (JSON array)
     try:
         if message.content and message.content.strip().startswith("[") and message.content.strip().endswith("]"):
             servers = json.loads(message.content)
             if isinstance(servers, list) and all(isinstance(x, dict) for x in servers):
                 print(f"Detected servers list with {len(servers)} servers. Sending to backend.")
-                send_servers_list_to_backend(servers)
+                for s in servers:
+                    pending_updates.append(s)
                 return
     except Exception as e:
         print(f"❌ Failed to parse servers list: {e}")
 
-    # Otherwise, parse as single embed
     info = parse_embed_fields(message)
-    print("Parsed info:", info)
     if info and info["name"] and info["jobid"]:
-        embed_payload = build_embed(info)
-        send_to_webhooks(embed_payload)
-        send_to_backend(info)
-        print(f"✅ Sent embed and backend for: {info['name']}")
+        pending_updates.append(info)
+        print(f"✅ Queued: {info['name']}")
     else:
         print("⚠️ Missing required fields. Skipping.")
+
+@tasks.loop(seconds=0.5)
+async def send_loop():
+    global pending_updates
+    if not pending_updates:
+        return
+
+    # Copy and clear the list to avoid race conditions
+    to_send = pending_updates[:]
+    pending_updates.clear()
+
+    for info in to_send:
+        if "jobId" in info:  # Already a full server object from list
+            # Send directly
+            try:
+                r = requests.post(BACKEND_URL, json=info, timeout=10)
+                if r.status_code == 200:
+                    print(f"✅ Sent server to backend: {info['name']}")
+                else:
+                    print(f"❌ Backend error {r.status_code}")
+            except Exception as e:
+                print(f"❌ Failed to send to backend: {e}")
+        else:
+            # Regular parsed embed
+            embed_payload = build_embed(info)
+            send_to_webhooks(embed_payload)
+            send_to_backend(info)
 
 client.run(TOKEN)
